@@ -5,7 +5,7 @@ import string
 class Trader:
 
     def bid(self):
-        return 15
+        return 10
     
     def run(self, state: TradingState):
         """Only method required. It takes all buy and sell orders for all
