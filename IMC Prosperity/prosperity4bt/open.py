@@ -1,3 +1,4 @@
+import threading
 import webbrowser
 from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -7,7 +8,10 @@ from typing import Any
 
 class HTTPRequestHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
-        self.server.shutdown_flag = True  # type: ignore[attr-defined]
+        # Only shut down after the actual log file is fetched, not on favicon/other requests
+        if self.path.endswith(".log"):
+            # Defer shutdown so the response finishes first
+            threading.Timer(2.0, self.server.shutdown).start()  # type: ignore[attr-defined]
         return super().do_GET()
 
     def end_headers(self) -> None:
@@ -18,12 +22,6 @@ class HTTPRequestHandler(SimpleHTTPRequestHandler):
         return
 
 
-class CustomHTTPServer(HTTPServer):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.shutdown_flag = False
-
-
 def open_visualizer(output_file: Path, visualizer_url: str | None = None) -> None:
     if visualizer_url is None:
         # Use local visualizer (forked from jmerle's P3 visualizer with Frankfurt Hedgehogs features)
@@ -32,11 +30,20 @@ def open_visualizer(output_file: Path, visualizer_url: str | None = None) -> Non
         visualizer_url = "http://localhost:5173/imc-prosperity-3-visualizer/"
 
     http_handler = partial(HTTPRequestHandler, directory=str(output_file.parent))
-    http_server = CustomHTTPServer(("localhost", 0), http_handler)
+    http_server = HTTPServer(("localhost", 0), http_handler)
 
     webbrowser.open(
         f"{visualizer_url}?open=http://localhost:{http_server.server_port}/{output_file.name}"
     )
 
-    while not http_server.shutdown_flag:
-        http_server.handle_request()
+    # serve_forever blocks until http_server.shutdown() is called from the request handler
+    # (after the .log file is fetched). Safety timeout kills it after 2 minutes if nothing happens.
+    shutdown_timer = threading.Timer(120.0, http_server.shutdown)
+    shutdown_timer.daemon = True
+    shutdown_timer.start()
+
+    try:
+        http_server.serve_forever()
+    finally:
+        shutdown_timer.cancel()
+        http_server.server_close()

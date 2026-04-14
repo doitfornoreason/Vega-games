@@ -35,7 +35,11 @@ class FileSystemReader(FileReader):
 class PackageResourcesReader(FileReader):
     def file(self, path_parts: list[str]) -> ContextManager[Optional[Path]]:
         try:
-            container = resources.files(f"prosperity4bt.resources.{'.'.join(path_parts[:-1])}")
+            if len(path_parts) > 1:
+                module = f"prosperity4bt.resources.{'.'.join(path_parts[:-1])}"
+            else:
+                module = "prosperity4bt.resources"
+            container = resources.files(module)
             file = container / path_parts[-1]
             if not file.is_file():
                 return wrap_in_context_manager(None)
