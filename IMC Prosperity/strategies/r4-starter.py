@@ -6,8 +6,8 @@ import sys
 
 
 # =================================================================
-# Black-Scholes helpers (inlined; no external deps so the strategy
-# uploads as a single file). Mirror utils/options_toolkit.py.
+# Black-Scholes helpers (inlined to keep the strategy a single file).
+# Used by _fair_value_theo_ewma_iv for IV solving + theo pricing.
 # =================================================================
 
 def _norm_cdf(x: float) -> float:
@@ -50,78 +50,13 @@ def _implied_vol(price: float, S: float, K: float, T: float, r: float,
     return sigma
 
 
-def _bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    if T <= 0 or sigma <= 0 or S <= 0:
-        return 0.0
-    d1 = _bs_d1(S, K, T, r, sigma)
-    return _norm_pdf(d1) / (S * sigma * math.sqrt(T))
-
-
-# =================================================================
-# Voucher MM configs
-# =================================================================
-
-VOUCHER_STRATEGY_CFGS = [
-    # VEV_4000, VEV_4500, and VEV_5000 use dedicated tier strategies (see
-    # _trade_voucher_tier + VEV4000_TIER_CFG / VEV4500_TIER_CFG /
-    # VEV5000_TIER_CFG); they are NOT in this list any more.
-    # Fix A is opt-in per cfg via "symmetric_skew": True. Applied only to
-    # 5100/5200 — the strikes that pinned long.
-    # Per-strike fix scoping:
-    #   inventory_skew_factor (Fix B): 5100  (NOT 5200 — hurt PnL)
-    #   fair_value_method=spot_intrinsic (Fix E): 5100  (NOT 5200 — TV too noisy)
-    # Strikes without these keys fall back to the default behaviour.
-    {"symbol": "VEV_5100", "position_limit": 300, "max_order_size": 25,
-     "transition_start": 80, "transition_end": 280,
-     "skew_factor": 0.15, "flatten_position": 280, "flatten_slope": 0.15,
-     "max_take_distance": 3, "anchor_alpha": 0.0005,
-     "symmetric_skew": True, "inventory_skew_factor": 3.0,
-     "fair_value_method": "spot_intrinsic"},
-    {"symbol": "VEV_5200", "position_limit": 300, "max_order_size": 25,
-     "transition_start": 112, "transition_end": 280,
-     "skew_factor": 0.1, "flatten_position": 280, "flatten_slope": 0.1,
-     "max_take_distance": 2, "anchor_alpha": 0.0001,
-     "symmetric_skew": True},
-]
-
-# =================================================================
-# Butterfly-momentum taker on VEV_5300 / VEV_5400
-# =================================================================
-
-BFLY_CFGS = [
-    {"center": 5300, "left": "VEV_5200", "mid": "VEV_5300", "right": "VEV_5400",
-     "threshold": 1.5, "ewma_alpha": 0.002,
-     "max_pos": 300, "take_size": 20},
-    {"center": 5400, "left": "VEV_5300", "mid": "VEV_5400", "right": "VEV_5500",
-     "threshold": 2.0, "ewma_alpha": 0.002,
-     "max_pos": 300, "take_size": 20},
-]
-
-# =================================================================
-# VELVET MM config
-# =================================================================
-
-VELVET_CFG = {
-    "symbol": "VELVETFRUIT_EXTRACT",
-    "position_limit": 200,
-    "max_order_size": 50,
-    "fair_value_method": "mid",
-    "anchor_alpha": 0.0005,
-    "transition_start": 75,
-    "transition_end": 165,
-    "skew_factor": 0.2,
-    "max_take_distance": 4,
-    "flatten_position": 165,
-    "flatten_slope": 0.2,
-}
-
 # =================================================================
 # HYDROGEL_PACK — tiered-band strategy.
-# Tier 1: when ask <= ANCHOR-BAND (or bid >= ANCHOR+BAND+10), aggressively
-#         load up to TIER1_LIMIT.
-# Tier 2: above TIER1_LIMIT but below SOFT_POSITION_LIMIT, only TAKE inside
-#         FV +/- FV_BAND.
-# Tier 3: at extreme positions (>=197 or <=-197), TAKE only against FV.
+# Tier 1: when ask <= ANCHOR - BAND (or bid >= ANCHOR + BAND + SELL_OFFSET),
+#         aggressively load up to TIER1_LIMIT.
+# Tier 2: above TIER1_LIMIT but below SOFT_POSITION_LIMIT, TAKE inside
+#         FV +/- FV_BAND (loose, unlike VELVET/voucher tier 2).
+# Tier 3: at extreme positions (>= 197 or <= -197), TAKE only against FV.
 # Plus penny-improve MAKE that's gated by anchor + soft-position state.
 # =================================================================
 
@@ -132,6 +67,7 @@ HYDRO_TIER1_LIMIT         = 175
 HYDRO_FV_BAND             = 1
 HYDRO_MM_SIZE             = 30
 HYDRO_SOFT_POSITION_LIMIT = 190
+HYDRO_SELL_OFFSET         = 10    # asymmetric sell-side trigger offset
 
 # =================================================================
 # VELVETFRUIT_EXTRACT — tiered-band strategy (mirrors HYDRO).
@@ -143,12 +79,13 @@ HYDRO_SOFT_POSITION_LIMIT = 190
 
 VELVET_POSITION_LIMIT      = 200
 VELVET_ANCHOR              = 5250
-VELVET_ANCHOR_BAND         = 10
+VELVET_ANCHOR_BAND         = 5     # swept winner (was 10) +$7,931 alone
 VELVET_TIER1_LIMIT         = 175
-VELVET_FV_BAND             = 1
+VELVET_FV_BAND             = 0     # swept winner (was 1) +$1,644 with band=5
 VELVET_MM_SIZE             = 30
 VELVET_SOFT_POSITION_LIMIT = 190
 VELVET_TAKE_NEG_SPOT       = 197
+VELVET_SELL_OFFSET         = 10    # asymmetric sell-side trigger offset
 
 # =================================================================
 # VEV_4000 / VEV_4500 / VEV_5000 — tiered-band strategies.
@@ -199,28 +136,107 @@ VEV5000_TIER_CFG = {
     "mm_fallback":         6,
 }
 
-# =================================================================
-# Gamma scalp on VELVETFRUIT_EXTRACT (delta-hedge voucher gamma).
-# Each tick: compute portfolio gamma from open voucher positions
-# (BS at IV implied from each option's mid), then trade VELVET
-# against spot moves to offset gamma*dS. Captures realized vol.
-# =================================================================
+# Theo-tier configs (VEV_5100/5200/5300/5400/5500). Anchor is dynamic:
+# BS theo at anchor_spot with EWMA-fitted IV, populated per-tick in run().
+# Bands scale with inside spread; top_offset = 0 because theo already
+# includes time value (no asymmetry needed).
+VEV5300_TIER_CFG = {
+    "symbol":              "VEV_5300",
+    # "anchor":            <set per-tick from theo>
+    "anchor_band":         5,
+    "anchor_top_offset":   0,
+    "position_limit":      300,
+    "tier1_limit":         295,
+    "fv_band":             1,
+    "mm_size":             30,
+    "soft_position_limit": 295,
+    "take_neg_spot":       298,
+    "mm_fallback":         2,
+    "iv_alpha":            0.05,
+    "anchor_spot":         5250.0,
+    "iv_seed":             0.2738,   # NOTE: re-calibrate per round (mean of Day-2 IV)
+}
+
+VEV5400_TIER_CFG = {
+    "symbol":              "VEV_5400",
+    "anchor_band":         3,
+    "anchor_top_offset":   0,
+    "position_limit":      300,
+    "tier1_limit":         295,
+    "fv_band":             1,
+    "mm_size":             25,
+    "soft_position_limit": 295,
+    "take_neg_spot":       298,
+    "mm_fallback":         1,
+    "iv_alpha":            0.05,
+    "anchor_spot":         5240.0,
+    "iv_seed":             0.2545,   # NOTE: re-calibrate per round
+    "anchor_spot_blend":   0.7,      # 5400 only: tracks VELVET (deep OTM, delta-driven)
+}
+
+VEV5500_TIER_CFG = {
+    "symbol":              "VEV_5500",
+    "anchor_band":         1,        # tight: theo can be 2-3, larger -> Tier 1 never fires
+    "anchor_top_offset":   0,
+    "position_limit":      300,
+    "tier1_limit":         295,
+    "fv_band":             1,
+    "mm_size":             10,       # smaller: thinnest book
+    "soft_position_limit": 295,
+    "take_neg_spot":       298,
+    "mm_fallback":         1,
+    "iv_alpha":            0.05,
+    "anchor_spot":         5256.0,
+    "iv_seed":             0.2780,   # round 3: day-2 mean
+    "anchor_spot_blend":   0.7,      # swept winner
+}
+
+VEV5100_TIER_CFG = {
+    "symbol":              "VEV_5100",
+    "anchor_band":         12,
+    "anchor_top_offset":   0,
+    "position_limit":      300,
+    "tier1_limit":         295,
+    "fv_band":             1,
+    "mm_size":             30,
+    "soft_position_limit": 295,
+    "take_neg_spot":       298,
+    "mm_fallback":         5,
+    "iv_alpha":            0.05,
+    "anchor_spot":         5250.0,
+    "anchor_spot_blend":   0.0,
+    "iv_seed":             0.2617,   # NOTE: re-calibrate per round
+}
+
+VEV5200_TIER_CFG = {
+    "symbol":              "VEV_5200",
+    "anchor_band":         10,
+    "anchor_top_offset":   0,
+    "position_limit":      300,
+    "tier1_limit":         295,
+    "fv_band":             1,
+    "mm_size":             30,
+    "soft_position_limit": 295,
+    "take_neg_spot":       298,
+    "mm_fallback":         3,
+    "iv_alpha":            0.05,
+    "anchor_spot":         5250.0,
+    "anchor_spot_blend":   0.0,
+    "iv_seed":             0.2684,   # NOTE: re-calibrate per round
+}
 
 TICKS_PER_DAY = 1_000_000
-
-# Vouchers have a 7-day life starting from round 1 (TTE_start = 8 - round).
-# Update this before each submission: round 3 -> 3, round 4 -> 4, round 5 -> 5.
+# Bump before each round submission: round 4 -> 4, round 5 -> 5.
+# (Voucher TTE_start = 8 - round; vouchers were 7-day from round 1.)
 SUBMISSION_ROUND = 4
 
 
 def compute_T_days(timestamp: int) -> float:
     """TTE in days. Round N starts at TTE = 8 - N.
 
-    Local backtester (prosperity4bt): runs 3 consecutive historical days
-    (rounds 1/2/3), sets PROSPERITY4BT_DAY = 0/1/2 -> TTE_start 7/6/5.
-    Prosperity submission: runs ONE live day at SUBMISSION_ROUND's TTE.
-
-    Reads env LAZILY (per-tick) via sys.modules to avoid the website's
+    Local backtester sets PROSPERITY4BT_DAY=0/1/2 (TTE_start 7/6/5).
+    Submission: env unset -> falls back to SUBMISSION_ROUND constant.
+    Env is read LAZILY per-tick via sys.modules to bypass the website's
     upload filter while still picking up env vars set by the local
     backtester after module reload.
     """
@@ -231,8 +247,7 @@ def compute_T_days(timestamp: int) -> float:
         round_num = int(env_day) + 1
     else:
         round_num = SUBMISSION_ROUND
-    tte_start = 8 - round_num
-    return max(tte_start - timestamp / TICKS_PER_DAY, 0.0)
+    return max(8 - round_num - timestamp / TICKS_PER_DAY, 0.0)
 
 
 RISK_FREE_RATE = 0.0
@@ -243,22 +258,14 @@ VEV_STRIKES = {
     "VEV_5400": 5400, "VEV_5500": 5500,
 }
 
-SCALP_SYMBOL         = "VELVETFRUIT_EXTRACT"
-SCALP_POSITION_LIMIT = 200
-SCALP_MIN_TRADE      = 5     # don't fire below this rebalance qty
-SCALP_MAX_SPREAD     = 2     # skip when underlying spread > this
+# Underlying symbol used for spot lookup in theo-tier voucher FV calc.
+UNDERLYING_SYMBOL = "VELVETFRUIT_EXTRACT"
 
 class Trader:
 
     # =========================================================================
-    # Fair-value helpers — VELVET mid and maker-quote filter
+    # Fair-value helpers
     # =========================================================================
-
-    def _fair_value_mid(self, order_depth: OrderDepth, prev_makers: dict) -> Tuple[float, dict]:
-        if not order_depth.buy_orders or not order_depth.sell_orders:
-            return None, prev_makers
-        fair = 0.5 * (max(order_depth.buy_orders) + min(order_depth.sell_orders))
-        return fair, prev_makers
 
     def _compute_fair_value_velvet(self, order_depth: OrderDepth):
         """VELVET-specific FV: vol-weighted across worst bid/ask + adjacent layer."""
@@ -301,26 +308,67 @@ class Trader:
                     count += av
         return total / count if count > 0 else None
 
-    def _fair_value_spot_intrinsic(self, order_depth: OrderDepth,
-                                    prev_makers: dict, cfg: dict) -> Tuple[float, dict]:
-        """Fix E: FV = max(S - K, 0) + EWMA(time_value)."""
-        spot = cfg.get("spot")
-        K = cfg.get("strike")
-        if (spot is None or K is None
+    def _fair_value_theo_ewma_iv(self, order_depth: OrderDepth,
+                                  prev_makers: dict, cfg: dict) -> Tuple[float, dict]:
+        """Theoretical FV via EWMA-fitted IV (theo-tier vouchers 5100-5500).
+
+        Per tick: solve IV from observed mid at current spot, EWMA-update,
+        then return BS price at the (optionally blended) anchor_spot.
+        Naturally decays with TTE; persists 'iv_ewma' across ticks.
+
+        cfg keys: strike, spot, T_days, iv_alpha (default 0.05),
+        anchor_spot (5250), anchor_spot_blend (0 = equilibrium, 1 = follow
+        spot), iv_min/iv_max sanity bounds (0.001 / 5.0).
+        """
+        K           = cfg.get("strike")
+        S_actual    = cfg.get("spot")
+        T_days      = cfg.get("T_days")
+        iv_alpha    = cfg.get("iv_alpha",    0.05)
+        anchor_spot_eq    = cfg.get("anchor_spot",       5250.0)
+        anchor_spot_blend = cfg.get("anchor_spot_blend", 0.0)
+        iv_min      = cfg.get("iv_min",      0.001)
+        iv_max      = cfg.get("iv_max",      5.0)
+
+        if (K is None or S_actual is None or T_days is None
+                or T_days <= 0 or S_actual <= 0
                 or not order_depth.buy_orders or not order_depth.sell_orders):
             return None, prev_makers
-        intrinsic = max(spot - K, 0)
-        mid = 0.5 * (max(order_depth.buy_orders) + min(order_depth.sell_orders))
-        tv = mid - intrinsic
-        alpha = cfg.get("tv_alpha", 0.1)
-        prev_tv = prev_makers.get("tv_ewma")
-        new_tv = tv if prev_tv is None else prev_tv + alpha * (tv - prev_tv)
+
+        # Blend equilibrium anchor with current spot (0 = pure equilibrium).
+        anchor_spot = ((1.0 - anchor_spot_blend) * anchor_spot_eq
+                       + anchor_spot_blend * S_actual)
+
+        T_years = T_days / 365.0
+        opt_mid = 0.5 * (max(order_depth.buy_orders) + min(order_depth.sell_orders))
+        if opt_mid <= 0:
+            return None, prev_makers
+
+        # Solve IV from observed mid; EWMA-update.
+        iv_now = _implied_vol(opt_mid, S_actual, K, T_years, RISK_FREE_RATE)
+        prev_iv = prev_makers.get("iv_ewma")
+        if iv_now <= iv_min or iv_now > iv_max:
+            new_iv = prev_iv     # solver failed/unreasonable -> hold last
+        elif prev_iv is None:
+            new_iv = iv_now
+        else:
+            new_iv = prev_iv + iv_alpha * (iv_now - prev_iv)
+
         new_prev = dict(prev_makers)
-        new_prev["tv_ewma"] = new_tv
-        return intrinsic + new_tv, new_prev
+        if new_iv is not None:
+            new_prev["iv_ewma"] = new_iv
+        if new_iv is None or new_iv <= iv_min:
+            return None, new_prev
+
+        # Theoretical anchor at the (blended) anchor spot with smoothed IV.
+        fair = _bs_call(anchor_spot, K, T_years, RISK_FREE_RATE, new_iv)
+        return fair, new_prev
 
     def compute_fair_value(self, order_depth: OrderDepth, prev_makers: dict) -> Tuple[float, dict]:
-        """Maker-quote filter with memory — used for HYDRO and vouchers."""
+        """Maker-quote filter with memory — used by HYDROGEL_PACK only.
+
+        Skips thin top-of-book quotes; persists last-seen "real" maker
+        levels across ticks so a temporarily thin book doesn't lose FV.
+        """
         sorted_bids = sorted(order_depth.buy_orders.items(), key=lambda x: -x[0])
         sorted_asks = sorted(order_depth.sell_orders.items(), key=lambda x: x[0])
 
@@ -407,170 +455,6 @@ class Trader:
         return fair, new_prev
 
     # =========================================================================
-    # Generic _mm — vouchers (5100/5200 only now)
-    # =========================================================================
-
-    def _mm(self, state: TradingState, cfg: dict, prev_makers: dict) -> Tuple[List[Order], dict]:
-        """TAKE (anchor-blended ref) + FLATTEN + MAKE (penny-improve, FV-gated)."""
-        symbol = cfg["symbol"]
-        depth  = state.order_depths.get(symbol)
-        if depth is None:
-            return [], prev_makers
-
-        orders: List[Order] = []
-
-        fv_method = cfg.get("fair_value_method")
-        if fv_method == "mid":
-            fair_value, new_prev = self._fair_value_mid(depth, prev_makers)
-        elif fv_method == "spot_intrinsic":
-            fair_value, new_prev = self._fair_value_spot_intrinsic(depth, prev_makers, cfg)
-        else:
-            fair_value, new_prev = self.compute_fair_value(depth, prev_makers)
-        if fair_value is None:
-            return orders, new_prev
-
-        position       = state.position.get(symbol, 0)
-        limit          = cfg["position_limit"]
-        buy_capacity   = limit - position
-        sell_capacity  = limit + position
-        max_order_size = cfg["max_order_size"]
-
-        anchor            = cfg["anchor"]
-        trans_start       = cfg["transition_start"]
-        trans_end         = cfg["transition_end"]
-        skew_factor       = cfg["skew_factor"]
-        max_take_distance = cfg["max_take_distance"]
-        abs_pos           = abs(position)
-
-        if abs_pos >= trans_end:
-            ref_price  = fair_value
-            units_past = abs_pos - trans_end
-            symmetric = cfg.get("symmetric_skew", False)
-            if position > 0:
-                buy_threshold  = units_past * skew_factor
-                sell_threshold = -units_past * skew_factor if symmetric else 0
-            else:
-                buy_threshold  = -units_past * skew_factor if symmetric else 0
-                sell_threshold = units_past * skew_factor
-            ask_ceiling = min(ref_price - buy_threshold,
-                              fair_value + max_take_distance)
-            bid_floor   = max(ref_price + sell_threshold,
-                              fair_value - max_take_distance)
-        else:
-            if abs_pos <= trans_start:
-                ref_price = anchor
-            else:
-                t = (abs_pos - trans_start) / (trans_end - trans_start)
-                ref_price = anchor * (1 - t) + fair_value * t
-            ask_ceiling = min(ref_price, fair_value + max_take_distance)
-            bid_floor   = max(ref_price, fair_value - max_take_distance)
-
-        if depth.sell_orders and buy_capacity > 0:
-            for ask_price in sorted(depth.sell_orders.keys()):
-                if buy_capacity <= 0 or ask_price >= ask_ceiling:
-                    break
-                take_size = min(max_order_size, buy_capacity,
-                                -depth.sell_orders[ask_price])
-                if take_size > 0:
-                    orders.append(Order(symbol, ask_price, take_size))
-                    buy_capacity -= take_size
-                    position     += take_size
-
-        if depth.buy_orders and sell_capacity > 0:
-            for bid_price in sorted(depth.buy_orders.keys(), reverse=True):
-                if sell_capacity <= 0 or bid_price <= bid_floor:
-                    break
-                take_size = min(max_order_size, sell_capacity,
-                                depth.buy_orders[bid_price])
-                if take_size > 0:
-                    orders.append(Order(symbol, bid_price, -take_size))
-                    sell_capacity -= take_size
-                    position      -= take_size
-
-        flatten_pos   = cfg["flatten_position"]
-        flatten_slope = cfg["flatten_slope"]
-
-        if position > flatten_pos and depth.buy_orders and sell_capacity > 0:
-            units_past   = position - flatten_pos
-            flatten_edge = units_past * flatten_slope
-            for bid_price in sorted(depth.buy_orders.keys(), reverse=True):
-                if sell_capacity <= 0:
-                    break
-                if bid_price >= fair_value:
-                    continue
-                if bid_price <= fair_value - flatten_edge:
-                    break
-                cap = position - flatten_pos
-                if cap <= 0:
-                    break
-                take_size = min(max_order_size, sell_capacity, cap,
-                                depth.buy_orders[bid_price])
-                if take_size > 0:
-                    orders.append(Order(symbol, bid_price, -take_size))
-                    sell_capacity -= take_size
-                    position      -= take_size
-        elif position < -flatten_pos and depth.sell_orders and buy_capacity > 0:
-            units_past   = -position - flatten_pos
-            flatten_edge = units_past * flatten_slope
-            for ask_price in sorted(depth.sell_orders.keys()):
-                if buy_capacity <= 0:
-                    break
-                if ask_price <= fair_value:
-                    continue
-                if ask_price >= fair_value + flatten_edge:
-                    break
-                cap = -position - flatten_pos
-                if cap <= 0:
-                    break
-                take_size = min(max_order_size, buy_capacity, cap,
-                                -depth.sell_orders[ask_price])
-                if take_size > 0:
-                    orders.append(Order(symbol, ask_price, take_size))
-                    buy_capacity -= take_size
-                    position     += take_size
-
-        sorted_bid_prices = sorted(depth.buy_orders.keys(), reverse=True)
-        sorted_ask_prices = sorted(depth.sell_orders.keys())
-
-        our_bid = None
-        if sorted_bid_prices and buy_capacity > 0:
-            our_bid = sorted_bid_prices[0] + 1
-            if our_bid >= fair_value and len(sorted_bid_prices) >= 2:
-                our_bid = sorted_bid_prices[1] + 1
-
-        our_ask = None
-        if sorted_ask_prices and sell_capacity > 0:
-            our_ask = sorted_ask_prices[0] - 1
-            if our_ask <= fair_value and len(sorted_ask_prices) >= 2:
-                our_ask = sorted_ask_prices[1] - 1
-
-        inv_skew_factor = cfg.get("inventory_skew_factor", 0.0)
-        if inv_skew_factor > 0 and limit > 0:
-            strike = cfg.get("strike")
-            if strike is not None and strike <= 5200:
-                _k = 3.0
-                _norm = position / limit
-                _sign = 1 if _norm >= 0 else -1
-                _exp_val = (math.exp(_k * abs(_norm)) - 1.0) / (math.exp(_k) - 1.0)
-                skew_pts = int(round(inv_skew_factor * _sign * _exp_val))
-            else:
-                skew_pts = int(round(inv_skew_factor * position / limit))
-            if skew_pts != 0:
-                if our_bid is not None:
-                    our_bid -= skew_pts
-                if our_ask is not None:
-                    our_ask -= skew_pts
-
-        if our_bid is not None and buy_capacity > 0 and our_bid < fair_value:
-            orders.append(Order(symbol, our_bid,
-                                min(max_order_size, buy_capacity)))
-        if our_ask is not None and sell_capacity > 0 and our_ask > fair_value:
-            orders.append(Order(symbol, our_ask,
-                                -min(max_order_size, sell_capacity)))
-
-        return orders, new_prev
-
-    # =========================================================================
     # VELVETFRUIT_EXTRACT — tiered-band strategy
     # =========================================================================
 
@@ -620,7 +504,7 @@ class Trader:
             vol  = order_depth.buy_orders[bid_price]
             size = 0
 
-            if bid_price >= VELVET_ANCHOR + VELVET_ANCHOR_BAND + 10:
+            if bid_price >= VELVET_ANCHOR + VELVET_ANCHOR_BAND + VELVET_SELL_OFFSET:
                 if position > -VELVET_TIER1_LIMIT:
                     room = max(0, VELVET_TIER1_LIMIT + position)
                     size = min(vol, sell_capacity, room)
@@ -679,7 +563,7 @@ class Trader:
         return orders
 
     # =========================================================================
-    # HYDROGEL_PACK — optimised ACO
+    # HYDROGEL_PACK — tiered-band strategy
     # =========================================================================
 
     def _trade_hydro(self, order_depth: OrderDepth, fair_value: float,
@@ -726,7 +610,7 @@ class Trader:
                 break
             vol = order_depth.buy_orders[bid_price]
 
-            if bid_price >= HYDRO_ANCHOR + HYDRO_ANCHOR_BAND + 10:
+            if bid_price >= HYDRO_ANCHOR + HYDRO_ANCHOR_BAND + HYDRO_SELL_OFFSET:
                 if position > -HYDRO_TIER1_LIMIT:
                     room = max(0, HYDRO_TIER1_LIMIT + position)
                     size = min(vol, sell_capacity, room)
@@ -785,7 +669,9 @@ class Trader:
         return orders
 
     # =========================================================================
-    # VEV_4000 / VEV_4500 / VEV_5000 — generic tiered-band strategy (cfg-driven)
+    # Generic tiered-band strategy (cfg-driven) — used by all 8 vouchers:
+    #   - VEV_4000/4500/5000: deep-ITM tier (fixed anchor = intrinsic, top-3 FV)
+    #   - VEV_5100/5200/5300/5400/5500: theo-tier (anchor = FV = BS theo with EWMA IV)
     # =========================================================================
 
     def _trade_voucher_tier(self, order_depth: OrderDepth, fair_value: float,
@@ -904,185 +790,27 @@ class Trader:
         return orders
 
     # =========================================================================
-    # Butterfly-momentum taker on VEV_5300 / VEV_5400
-    # =========================================================================
-
-    def _take_butterfly_momentum(self, state: TradingState,
-                                  bfly_mem: dict) -> Tuple[dict, dict]:
-        orders_by_sym: dict = {}
-        new_mem = dict(bfly_mem)
-
-        for cfg in BFLY_CFGS:
-            left_sym = cfg["left"]; mid_sym = cfg["mid"]; right_sym = cfg["right"]
-            d_left  = state.order_depths.get(left_sym)
-            d_mid   = state.order_depths.get(mid_sym)
-            d_right = state.order_depths.get(right_sym)
-            if not (d_left and d_mid and d_right
-                    and d_left.buy_orders  and d_left.sell_orders
-                    and d_mid.buy_orders   and d_mid.sell_orders
-                    and d_right.buy_orders and d_right.sell_orders):
-                continue
-
-            mid_left  = 0.5 * (max(d_left.buy_orders)  + min(d_left.sell_orders))
-            mid_mid   = 0.5 * (max(d_mid.buy_orders)   + min(d_mid.sell_orders))
-            mid_right = 0.5 * (max(d_right.buy_orders) + min(d_right.sell_orders))
-            bf = mid_left - 2 * mid_mid + mid_right
-
-            key       = f"bf_{cfg['center']}_ewma"
-            prev_ewma = bfly_mem.get(key)
-            alpha     = cfg["ewma_alpha"]
-            ewma      = bf if prev_ewma is None else prev_ewma + alpha * (bf - prev_ewma)
-            new_mem[key] = ewma
-
-            if prev_ewma is None:
-                continue
-
-            dev       = bf - ewma
-            threshold = cfg["threshold"]
-            pos       = state.position.get(mid_sym, 0)
-            max_pos   = cfg["max_pos"]
-            size_cap  = cfg["take_size"]
-
-            if dev > threshold and pos > -max_pos:
-                bid     = max(d_mid.buy_orders.keys())
-                bid_vol = d_mid.buy_orders[bid]
-                size    = min(size_cap, max_pos + pos, bid_vol)
-                if size > 0:
-                    orders_by_sym.setdefault(mid_sym, []).append(
-                        Order(mid_sym, bid, -size))
-            elif dev < -threshold and pos < max_pos:
-                ask     = min(d_mid.sell_orders.keys())
-                ask_vol = -d_mid.sell_orders[ask]
-                size    = min(size_cap, max_pos - pos, ask_vol)
-                if size > 0:
-                    orders_by_sym.setdefault(mid_sym, []).append(
-                        Order(mid_sym, ask, size))
-
-        return orders_by_sym, new_mem
-
-    # =========================================================================
-    # Gamma scalp on VELVETFRUIT_EXTRACT
-    # =========================================================================
-
-    def _voucher_gamma(self, S: float, K: int, T_years: float,
-                       option_price: float) -> float:
-        """Solve IV from option mid, return BS gamma. Returns 0 on failure."""
-        if T_years <= 0 or S <= 0 or option_price <= 0:
-            return 0.0
-        iv = _implied_vol(option_price, S, K, T_years, RISK_FREE_RATE)
-        if iv <= 0 or iv > 20:
-            return 0.0
-        return _bs_gamma(S, K, T_years, RISK_FREE_RATE, iv)
-
-    def _gamma_scalp(self, state: TradingState, prev_S,
-                     mm_velvet_orders: List[Order], T_days: float) -> List[Order]:
-        """Delta-hedge voucher gamma by trading VELVET against spot moves.
-        Appends extra VELVET orders to mm_velvet_orders."""
-        scalp_depth = state.order_depths.get(SCALP_SYMBOL)
-        if (scalp_depth is None or not scalp_depth.buy_orders
-                or not scalp_depth.sell_orders):
-            return mm_velvet_orders
-
-        S = 0.5 * (max(scalp_depth.buy_orders) + min(scalp_depth.sell_orders))
-
-        if prev_S is None:
-            return mm_velvet_orders
-
-        delta_S = S - prev_S
-        if delta_S == 0:
-            return mm_velvet_orders
-
-        T_years = T_days / 365.0
-
-        portfolio_gamma = 0.0
-        for sym, K in VEV_STRIKES.items():
-            pos = state.position.get(sym, 0)
-            if pos == 0:
-                continue
-            opt_depth = state.order_depths.get(sym)
-            if (opt_depth is None or not opt_depth.buy_orders
-                    or not opt_depth.sell_orders):
-                continue
-            opt_mid = 0.5 * (max(opt_depth.buy_orders) + min(opt_depth.sell_orders))
-            portfolio_gamma += pos * self._voucher_gamma(S, K, T_years, opt_mid)
-
-        if portfolio_gamma == 0.0:
-            return mm_velvet_orders
-
-        rebalance_qty = -round(portfolio_gamma * delta_S)
-        if abs(rebalance_qty) < SCALP_MIN_TRADE:
-            return mm_velvet_orders
-
-        best_bid = max(scalp_depth.buy_orders.keys())
-        best_ask = min(scalp_depth.sell_orders.keys())
-        if best_ask - best_bid > SCALP_MAX_SPREAD:
-            return mm_velvet_orders
-
-        current_pos   = state.position.get(SCALP_SYMBOL, 0)
-        mm_net        = sum(o.quantity for o in mm_velvet_orders)
-        projected_pos = current_pos + mm_net
-
-        scalp_orders = list(mm_velvet_orders)
-
-        if rebalance_qty > 0:
-            capacity = SCALP_POSITION_LIMIT - projected_pos
-            qty = min(rebalance_qty, capacity, -scalp_depth.sell_orders[best_ask])
-            if qty > 0:
-                scalp_orders.append(Order(SCALP_SYMBOL, best_ask, qty))
-        else:
-            capacity = SCALP_POSITION_LIMIT + projected_pos
-            qty = min(-rebalance_qty, capacity, scalp_depth.buy_orders[best_bid])
-            if qty > 0:
-                scalp_orders.append(Order(SCALP_SYMBOL, best_bid, -qty))
-
-        return scalp_orders
-
-    # =========================================================================
-    # EWMA anchor update (VELVET and vouchers)
-    # =========================================================================
-
-    def _update_anchor(self, state: TradingState, symbol: str, alpha: float,
-                       prev_anchor):
-        depth = state.order_depths.get(symbol)
-        if depth is None or not depth.buy_orders or not depth.sell_orders:
-            return prev_anchor
-        mid = 0.5 * (max(depth.buy_orders) + min(depth.sell_orders))
-        if prev_anchor is None:
-            return mid
-        return prev_anchor + alpha * (mid - prev_anchor)
-
-    # =========================================================================
     # run
     # =========================================================================
 
     def run(self, state: TradingState):
-        if state.traderData:
-            memory = json.loads(state.traderData)
-        else:
-            memory = {}
-        memory.setdefault("velvet_prev_makers", {})
+        memory = json.loads(state.traderData) if state.traderData else {}
         memory.setdefault("hydro_prev_makers", {})
         memory.setdefault("voucher_mm_makers", {})
-        memory.setdefault("voucher_anchors", {})
 
         result = {}
 
-        # --- VELVETFRUIT_EXTRACT — tiered-band strategy (custom worst-layer FV) ---
-        symbol = VELVET_CFG["symbol"]
-        if symbol in state.order_depths:
-            velvet_depth = state.order_depths[symbol]
+        # --- VELVETFRUIT_EXTRACT — tiered-band strategy (worst-layer FV) ---
+        if UNDERLYING_SYMBOL in state.order_depths:
+            velvet_depth = state.order_depths[UNDERLYING_SYMBOL]
             velvet_fv    = self._compute_fair_value_velvet(velvet_depth)
             if velvet_fv is not None:
-                velvet_pos = state.position.get(symbol, 0)
-                result[symbol] = self._trade_velvet_tier(
+                velvet_pos = state.position.get(UNDERLYING_SYMBOL, 0)
+                result[UNDERLYING_SYMBOL] = self._trade_velvet_tier(
                     velvet_depth, velvet_fv, velvet_pos
                 )
-            else:
-                result[symbol] = []
-        else:
-            result[symbol] = []
 
-        # --- HYDROGEL_PACK — optimised ACO ---
+        # --- HYDROGEL_PACK — tiered-band strategy (maker-filter FV) ---
         if "HYDROGEL_PACK" in state.order_depths:
             hydro_depth = state.order_depths["HYDROGEL_PACK"]
             hydro_fv, memory["hydro_prev_makers"] = self.compute_fair_value(
@@ -1093,67 +821,48 @@ class Trader:
                 result["HYDROGEL_PACK"] = self._trade_hydro(
                     hydro_depth, hydro_fv, hydro_pos
                 )
-            else:
-                result["HYDROGEL_PACK"] = []
 
-        # --- VEV_4000 / VEV_4500 / VEV_5000 — dedicated tier strategies (top-3 FV) ---
+        # --- VEV_4000 / 4500 / 5000 — deep-ITM tier with top-3 FV, fixed anchor ---
         for tier_cfg in (VEV4000_TIER_CFG, VEV4500_TIER_CFG, VEV5000_TIER_CFG):
             sym = tier_cfg["symbol"]
-            if sym in state.order_depths:
-                depth = state.order_depths[sym]
-                fv    = self._compute_fair_value_top3(depth)
-                if fv is not None:
-                    pos = state.position.get(sym, 0)
-                    result[sym] = self._trade_voucher_tier(depth, fv, pos, tier_cfg)
-                else:
-                    result[sym] = []
-            else:
-                result[sym] = []
-
-        # --- Voucher MM (5100/5200 only — 4000/4500/5000 handled above) ---
-        und_depth_for_voucher = state.order_depths.get(SCALP_SYMBOL)
-        spot_for_voucher = None
-        if (und_depth_for_voucher and und_depth_for_voucher.buy_orders
-                and und_depth_for_voucher.sell_orders):
-            spot_for_voucher = 0.5 * (max(und_depth_for_voucher.buy_orders)
-                                       + min(und_depth_for_voucher.sell_orders))
-
-        for cfg in VOUCHER_STRATEGY_CFGS:
-            sym         = cfg["symbol"]
-            prev_anchor = memory["voucher_anchors"].get(sym)
-            anchor      = self._update_anchor(state, sym,
-                                              cfg["anchor_alpha"], prev_anchor)
-            if anchor is None:
+            depth = state.order_depths.get(sym)
+            if depth is None:
                 continue
-            memory["voucher_anchors"][sym] = anchor
+            fv = self._compute_fair_value_top3(depth)
+            if fv is None:
+                continue
+            pos = state.position.get(sym, 0)
+            result[sym] = self._trade_voucher_tier(depth, fv, pos, tier_cfg)
 
-            dynamic_cfg = {**cfg, "anchor": anchor,
-                           "spot": spot_for_voucher,
-                           "strike": VEV_STRIKES.get(sym)}
-            prev = memory["voucher_mm_makers"].setdefault(sym, {})
-            orders, memory["voucher_mm_makers"][sym] = self._mm(
-                state, dynamic_cfg, prev
-            )
-            if orders:
-                result[sym] = orders
+        # --- VEV_5100 / 5200 / 5300 / 5400 / 5500 — theo-tier with EWMA-IV anchor ---
+        und_depth = state.order_depths.get(UNDERLYING_SYMBOL)
+        if (und_depth and und_depth.buy_orders and und_depth.sell_orders):
+            spot = 0.5 * (max(und_depth.buy_orders) + min(und_depth.sell_orders))
+            T_days_now = compute_T_days(state.timestamp)
 
-        # --- Butterfly-momentum taker ---
-        bfly_mem = memory.setdefault("bfly", {})
-        bfly_orders, memory["bfly"] = self._take_butterfly_momentum(state, bfly_mem)
-        for sym, ords in bfly_orders.items():
-            result.setdefault(sym, []).extend(ords)
-
-        # --- Gamma scalp on VELVETFRUIT_EXTRACT (delta-hedge voucher gamma) ---
-        T_days           = compute_T_days(state.timestamp)
-        prev_S           = memory.get("scalp_prev_S")
-        mm_velvet_orders = list(result.get(SCALP_SYMBOL, []))
-        result[SCALP_SYMBOL] = self._gamma_scalp(
-            state, prev_S, mm_velvet_orders, T_days
-        )
-        scalp_depth = state.order_depths.get(SCALP_SYMBOL)
-        if scalp_depth and scalp_depth.buy_orders and scalp_depth.sell_orders:
-            memory["scalp_prev_S"] = 0.5 * (
-                max(scalp_depth.buy_orders) + min(scalp_depth.sell_orders)
-            )
+            for tier_cfg in (VEV5100_TIER_CFG, VEV5200_TIER_CFG, VEV5300_TIER_CFG,
+                             VEV5400_TIER_CFG, VEV5500_TIER_CFG):
+                sym = tier_cfg["symbol"]
+                depth = state.order_depths.get(sym)
+                if not depth or not depth.buy_orders or not depth.sell_orders:
+                    continue
+                prev = memory["voucher_mm_makers"].setdefault(sym, {})
+                # Seed IV EWMA on first tick to avoid cold-start
+                if "iv_ewma" not in prev and "iv_seed" in tier_cfg:
+                    prev["iv_ewma"] = tier_cfg["iv_seed"]
+                cfg_with_ctx = {**tier_cfg,
+                                "strike": VEV_STRIKES.get(sym),
+                                "spot":   spot,
+                                "T_days": T_days_now}
+                theo_fv, memory["voucher_mm_makers"][sym] = \
+                    self._fair_value_theo_ewma_iv(depth, prev, cfg_with_ctx)
+                if theo_fv is None:
+                    continue
+                # Use theo as both FV and anchor for tier strategy
+                cfg_with_ctx["anchor"] = theo_fv
+                pos = state.position.get(sym, 0)
+                result[sym] = self._trade_voucher_tier(
+                    depth, theo_fv, pos, cfg_with_ctx
+                )
 
         return result, 0, json.dumps(memory)
